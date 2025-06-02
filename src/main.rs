@@ -1,170 +1,127 @@
-use std::{
-    sync::{
-        atomic::{AtomicU64, Ordering},
-        Arc,
-    },
-    time::{SystemTime, UNIX_EPOCH},
-};
-
 use axum::{
     extract::{Path, Query, State},
     http::StatusCode,
-    routing::{get, post},
+    response::Result,
+    routing::{get, patch, post},
     Json, Router,
 };
+use database::Database;
+use sqlx::{migrate::MigrateDatabase, Sqlite};
 use types::{
-    AppState, GetVideosQuery, GetVideosResponse, UploadVideoRequest, Video, VideoResponse,
+    AppError, CreateTodoRequest, GetTodosQuery, GetTodosResponse, Todo, UpdateTodoRequest,
 };
-use uuid::Uuid;
-
+mod database;
 mod types;
 
-impl AppState {
-    async fn increment_likes(&self, video_id: &str) -> Result<u64, &'static str> {
-        // Find video
-        let video = {
-            let videos = self.videos.read().unwrap();
-            videos.get(video_id).cloned()
-        };
-
-        match video {
-            Some(video) => {
-                // Handle race condition
-                let new_likes = video.likes.fetch_add(1, Ordering::Relaxed) + 1;
-
-                Ok(new_likes)
-            }
-            None => Err("Video not found"),
-        }
-    }
-
-    async fn increment_views(&self, video_id: &str) -> Result<u64, &'static str> {
-        let video = {
-            let videos = self.videos.read().unwrap();
-            videos.get(video_id).cloned()
-        };
-
-        match video {
-            Some(video) => {
-                let new_views = video.views.fetch_add(1, Ordering::Relaxed) + 1;
-
-                Ok(new_views)
-            }
-            None => Err("Video not found"),
-        }
-    }
-}
-
 // functions
-async fn get_videos(
-    Query(params): Query<GetVideosQuery>,
-    State(state): State<AppState>,
-) -> Result<Json<GetVideosResponse>, StatusCode> {
+async fn get_todos(
+    Query(params): Query<GetTodosQuery>,
+    State(db): State<Database>,
+) -> Result<Json<GetTodosResponse>, StatusCode> {
     let page = params.page.unwrap_or(0);
     let limit = params.limit.unwrap_or(10).min(50);
-    let sort = params.sort.unwrap_or_else(|| "trending".to_string());
 
-    let videos = state.videos.read().unwrap();
-    let mut video_list: Vec<VideoResponse> = videos.values().map(VideoResponse::from).collect();
-
-    // Sort
-    match sort.as_str() {
-        "recent" => video_list.sort_by(|a, b| b.created_at.cmp(&a.created_at)),
-        "popular" => video_list.sort_by(|a, b| b.likes.cmp(&a.likes)),
-        _ => todo!(),
-    }
+    let todos = db
+        .list(page, limit)
+        .await
+        .map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)?;
 
     // Pagination
-    let total_videos = video_list.len();
-    let total_pages = (total_videos + limit - 1) / limit;
+    let total = todos.len();
 
-    let start = page * limit;
-    let end = (start + limit).min(total_videos);
-
-    let paginated_videos = if start < total_videos {
-        video_list[start..end].to_vec()
-    } else {
-        vec![]
-    };
-
-    Ok(Json(GetVideosResponse {
-        videos: paginated_videos,
-        page,
-        total_pages,
-        total_videos,
-    }))
+    Ok(Json(GetTodosResponse { todos, total }))
 }
 
-async fn get_video(
-    Path(video_id): Path<String>,
-    State(state): State<AppState>,
-) -> Result<Json<VideoResponse>, StatusCode> {
-    let _ = state.increment_views(&video_id).await;
+async fn get_todo(
+    Path(todo_id): Path<String>,
+    State(db): State<Database>,
+) -> Result<Json<Todo>, StatusCode> {
+    let todo = db
+        .get(todo_id)
+        .await
+        .map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)?;
 
-    let videos = state.videos.read().unwrap();
-    match videos.get(&video_id) {
-        Some(video) => Ok(Json(VideoResponse::from(video))),
+    match todo {
+        Some(res) => Ok(Json(res)),
         None => Err(StatusCode::NOT_FOUND),
     }
 }
 
-async fn create_video(
-    State(state): State<AppState>,
-    Json(payload): Json<UploadVideoRequest>,
-) -> Result<Json<VideoResponse>, StatusCode> {
-    let video_id = Uuid::new_v4().to_string();
-    let now = SystemTime::now()
-        .duration_since(UNIX_EPOCH)
-        .unwrap()
-        .as_secs();
-
-    let video = Video {
-        id: video_id.clone(),
-        title: payload.title,
-        creator: payload.creator,
-        description: payload.description,
-        url: payload.url,
-        created_at: now,
-        likes: Arc::new(AtomicU64::new(0)),
-        views: Arc::new(AtomicU64::new(0)),
-    };
-
-    let response = VideoResponse::from(&video);
-
-    // Safe write
-    {
-        let mut videos = state.videos.write().unwrap();
-        videos.insert(video_id.clone(), video);
-    }
-
-    Ok(Json(response))
-}
-async fn like_video(
-    Path(video_id): Path<String>,
-    State(state): State<AppState>,
+async fn create_todo(
+    State(db): State<Database>,
+    Json(payload): Json<CreateTodoRequest>,
 ) -> Result<Json<serde_json::Value>, StatusCode> {
-    match state.increment_likes(&video_id).await {
-        Ok(likes) => Ok(Json(serde_json::json!({
-            "video_id": video_id,
-            "likes": likes,
-            "message": "Video liked successfully"
+    let todo_id = db
+        .create(payload)
+        .await
+        .map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)?;
+
+    Ok(Json(serde_json::json!({
+        "todo_id": todo_id
+    })))
+}
+
+async fn update_todo(
+    Path(todo_id): Path<String>,
+    State(db): State<Database>,
+    Json(payload): Json<UpdateTodoRequest>,
+) -> Result<Json<serde_json::Value>, StatusCode> {
+    match db.update(todo_id.clone(), payload).await {
+        Ok(_) => Ok(Json(serde_json::json!({
+            "todo_id": todo_id
+        }))),
+        Err(_) => Err(StatusCode::NOT_FOUND),
+    }
+}
+
+async fn delete_todo(
+    Path(todo_id): Path<String>,
+    State(db): State<Database>,
+) -> Result<Json<serde_json::Value>, StatusCode> {
+    match db.delete(todo_id.clone()).await {
+        Ok(_) => Ok(Json(serde_json::json!({
+            "todo_id": todo_id
         }))),
         Err(_) => Err(StatusCode::NOT_FOUND),
     }
 }
 
 #[tokio::main]
-async fn main() {
-    let state = types::AppState::new();
+async fn main() -> Result<(), AppError> {
+    let db_path = "sqlite:todos.db";
 
-    // router
+    if !Sqlite::database_exists(&db_path).await.unwrap_or(false) {
+        match Sqlite::create_database(&db_path).await {
+            Ok(_) => println!("Database created"),
+            Err(e) => println!("Error creating database: {}", e),
+        }
+    } else {
+        println!("Database already exists");
+    }
+
+    let db = Database::new(db_path).await?;
+
+    db.migrate().await?;
+    println!("Database migrations completed successfully");
+
+    // Router
     let app = Router::new()
-        .route("/api/videos", get(get_videos).post(create_video))
-        .route("/api/videos/:id", get(get_video))
-        .route("/api/videos/:id/like", post(like_video))
-        .with_state(state);
+        .route("/api/todos", get(get_todos).post(create_todo))
+        .route(
+            "/api/todos/{id}",
+            get(get_todo).delete(delete_todo).patch(update_todo),
+        )
+        .with_state(db);
 
-    let listener = tokio::net::TcpListener::bind("0.0.0.0:3000").await.unwrap();
+    let listener = tokio::net::TcpListener::bind("0.0.0.0:3000")
+        .await
+        .map_err(|err| AppError::Internal(err))?;
 
-    axum::serve(listener, app).await.unwrap();
+    println!("Server starting on http://0.0.0.0:3000");
+
+    axum::serve(listener, app)
+        .await
+        .map_err(|err| AppError::Internal(err))?;
+
+    Ok(())
 }

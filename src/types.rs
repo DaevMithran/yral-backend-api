@@ -1,97 +1,86 @@
-use serde::{Deserialize, Serialize};
-use std::{
-    collections::HashMap,
-    sync::{
-        atomic::{AtomicU64, Ordering},
-        Arc, RwLock,
-    },
+use std::io::Error;
+
+use axum::{
+    http::StatusCode,
+    response::{IntoResponse, Response},
+    Error as AxumError, Json,
 };
+use chrono::{DateTime, Utc};
+use serde::{Deserialize, Serialize};
+use serde_json::json;
+use sqlx::migrate::MigrateError;
+use validator::Validate;
 
-#[derive(Debug, Clone, Serialize, Deserialize)]
-pub struct Video {
+#[derive(Debug, Clone, Serialize, Deserialize, sqlx::FromRow)]
+pub struct Todo {
     pub id: String,
-    pub title: String,
-    pub description: String,
-    pub creator: String,
-    pub url: String,
-    pub created_at: u64,
-
-    #[serde(skip)]
-    pub likes: Arc<AtomicU64>,
-    #[serde(skip)]
-    pub views: Arc<AtomicU64>,
+    pub data: String,
+    pub is_complete: bool,
+    pub created_at: DateTime<Utc>,
+    pub updated_at: DateTime<Utc>,
 }
 
-#[derive(Debug, Serialize, Clone)]
-pub struct VideoResponse {
-    id: String,
-    title: String,
-    creator: String,
-    video_url: String,
-    pub created_at: u64,
-    pub likes: u64,
-    views: u64,
+#[derive(Debug, Deserialize, Validate)]
+pub struct CreateTodoRequest {
+    #[validate(length(min = 1, max = 1000, message = "Data must be below 1000 characters"))]
+    pub data: String,
 }
 
-impl From<&Video> for VideoResponse {
-    fn from(video: &Video) -> Self {
-        let likes = video.likes.load(Ordering::Relaxed);
-        let views = video.views.load(Ordering::Relaxed);
-
-        VideoResponse {
-            id: video.id.clone(),
-            title: video.title.clone(),
-            creator: video.creator.clone(),
-            video_url: video.url.clone(),
-            created_at: video.created_at,
-            likes,
-            views,
-        }
-    }
-}
-
-#[derive(Clone)]
-pub struct AppState {
-    pub videos: Arc<RwLock<HashMap<String, Video>>>,
-}
-
-impl AppState {
-    pub fn new() -> Self {
-        Self {
-            // Arc  -> shared ownersip across async tasks
-            // Rwlock -> Many readers or one writer
-            videos: Arc::new(RwLock::new(HashMap::new())),
-        }
-    }
-}
-
-#[derive(Debug, Deserialize)]
-pub struct UploadVideoRequest {
-    pub title: String,
-    pub creator: String,
-    pub description: String,
-    pub url: String,
+#[derive(Debug, Deserialize, Validate)]
+pub struct UpdateTodoRequest {
+    #[validate(length(min = 1, max = 1000, message = "Data must be below 1000 characters"))]
+    pub data: String,
+    pub is_complete: bool,
 }
 
 #[derive(Debug, Serialize)]
-pub struct GetVideosResponse {
-    pub videos: Vec<VideoResponse>,
-    pub page: usize,
-    pub total_pages: usize,
-    pub total_videos: usize,
+pub struct GetTodoResponse {
+    pub data: String,
+}
+
+#[derive(Debug, Serialize)]
+pub struct GetTodosResponse {
+    pub todos: Vec<Todo>,
+    pub total: usize,
 }
 
 #[derive(Debug, Deserialize)]
-pub struct GetVideosQuery {
-    pub page: Option<usize>,
-    pub limit: Option<usize>,
-    pub sort: Option<String>,
+pub struct GetTodosQuery {
+    pub page: Option<u32>,
+    pub limit: Option<u32>,
 }
 
-// TODO: implement notifications
-enum NotifyMessage {
-    Like { video_id: String, likes: u64 },
-    View { video_id: String, views: u64 },
-    Comment { video_id: String, comments: u64 },
-    NewVideo { video: Video },
+#[derive(Debug)]
+pub enum AppError {
+    Database(sqlx::Error),
+    Migration(MigrateError),
+    Internal(Error),
+    Axum(AxumError),
+}
+
+impl From<sqlx::Error> for AppError {
+    fn from(err: sqlx::Error) -> Self {
+        AppError::Database(err)
+    }
+}
+
+impl From<MigrateError> for AppError {
+    fn from(err: MigrateError) -> Self {
+        AppError::Migration(err)
+    }
+}
+
+impl IntoResponse for AppError {
+    fn into_response(self) -> Response {
+        let (status, err_msg) = match self {
+            AppError::Database(_) => (StatusCode::INTERNAL_SERVER_ERROR, "Database error occurred"),
+            _ => (StatusCode::INTERNAL_SERVER_ERROR, "Internal error occurred"),
+        };
+        let body = Json(json!({
+            "error": err_msg,
+            "status":  status.as_u16()
+        }));
+
+        (status, body).into_response()
+    }
 }
